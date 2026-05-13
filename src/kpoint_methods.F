@@ -1713,23 +1713,15 @@ CONTAINS
                END IF
 
                ! DM path replicates P(k_IBZ) across the DBCSR group inside
-               ! dbcsr_to_dense_complex, so it works at any rank count.
-               ! MO path still needs the IBZ MO FM tile fully local on this
-               ! rank, so gate it on single-rank.
-               BLOCK
-                  INTEGER                                 :: spglib_numnodes
-                  TYPE(dbcsr_distribution_type)           :: spglib_dist
-                  CALL dbcsr_get_info(rpmat, distribution=spglib_dist)
-                  CALL dbcsr_distribution_get(spglib_dist, numnodes=spglib_numnodes)
-                  use_spglib = kpoint%use_spglib_dm .AND. ASSOCIATED(kpoint%scoord)
-                  ! MO rotation requires direct MO access (single-MPI) and
-                  ! is currently unavailable when constructing the energy-
-                  ! weighted DM via an external pmat (do_ext) because the MO
-                  ! eigenvalues have not been refreshed.
-                  use_mo_rot = use_spglib .AND. my_kpgrp .AND. ASSOCIATED(kp) .AND. &
-                               ASSOCIATED(kp%mos) .AND. (.NOT. do_ext) &
-                               .AND. (spglib_numnodes == 1)
-               END BLOCK
+               ! dbcsr_to_dense_complex. MO path replicates the IBZ MO FM
+               ! tile via cp_fm_get_submatrix in spglib_mo_workspace_init.
+               ! Both work at any rank count.
+               use_spglib = kpoint%use_spglib_dm .AND. ASSOCIATED(kpoint%scoord)
+               ! MO rotation is unavailable when constructing the energy-
+               ! weighted DM via an external pmat (do_ext) because the MO
+               ! eigenvalues have not been refreshed at that point.
+               use_mo_rot = use_spglib .AND. my_kpgrp .AND. ASSOCIATED(kp) .AND. &
+                            ASSOCIATED(kp%mos) .AND. (.NOT. do_ext)
                IF (use_mo_rot) THEN
                   ! FHI-spglib-style: rotate each KS eigenvector first, then
                   ! form P(k_star) = sum_n w_n c_rot,n c_rot,n^H. The atom

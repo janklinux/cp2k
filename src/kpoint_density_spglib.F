@@ -29,7 +29,7 @@ MODULE kpoint_density_spglib
         dbcsr_get_block_p, dbcsr_get_info, dbcsr_get_matrix_type, dbcsr_iterator_blocks_left, &
         dbcsr_iterator_next_block, dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, &
         dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry
-   USE cp_fm_types,                     ONLY: cp_fm_get_info, cp_fm_type
+   USE cp_fm_types,                     ONLY: cp_fm_get_submatrix, cp_fm_type
    USE kinds,                           ONLY: dp
    USE kpoint_types,                    ONLY: kpoint_env_type, kpoint_sym_type, kpoint_type
    USE mathconstants,                   ONLY: twopi
@@ -246,10 +246,9 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: ispin
       LOGICAL, INTENT(IN)                                :: real_only, wtype
 
-      INTEGER                                            :: imo, nao, ncol_local, nmo, nrow_local
+      INTEGER                                            :: imo, nao, nmo
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: cre, cim
       REAL(KIND=dp), DIMENSION(:), POINTER               :: eigenvalues, occupation
-      REAL(KIND=dp), DIMENSION(:, :), POINTER, &
-         CONTIGUOUS                                       :: cre, cim
       TYPE(cp_fm_type), POINTER                          :: mo_coeff_im, mo_coeff_re
 
       CPASSERT(ASSOCIATED(kpoint))
@@ -274,21 +273,18 @@ CONTAINS
 
       ws%nmo = nmo
 
-      ! Single-node check via the local FM tile shape.
-      CALL cp_fm_get_info(mo_coeff_re, nrow_local=nrow_local, ncol_local=ncol_local)
-      IF (nrow_local /= nao .OR. ncol_local /= nmo) THEN
-         CALL cp_abort(__LOCATION__, &
-                       "kpoint_density_spglib: distributed MO storage not yet supported "// &
-                       "(single MPI rank required)")
-      END IF
-      cre => mo_coeff_re%local_data
+      ! Replicate the (block-cyclic) MO coefficient FMs into dense (nao, nmo)
+      ! buffers that every rank holds in full. cp_fm_get_submatrix zeros the
+      ! target, writes locally-owned entries, and does an MPI sum across the
+      ! para_env -- so we end up with the same dense MO matrix on each rank.
+      ALLOCATE (cre(nao, nmo))
+      CALL cp_fm_get_submatrix(mo_coeff_re, cre)
 
       IF (.NOT. real_only) THEN
          CALL get_mo_set(kp_env%mos(2, ispin), mo_coeff=mo_coeff_im)
          CPASSERT(ASSOCIATED(mo_coeff_im))
-         cim => mo_coeff_im%local_data
-      ELSE
-         NULLIFY (cim)
+         ALLOCATE (cim(nao, nmo))
+         CALL cp_fm_get_submatrix(mo_coeff_im, cim)
       END IF
 
       ALLOCATE (ws%mos_kibz(ws%n_basis_tot, nmo))
@@ -303,6 +299,8 @@ CONTAINS
       ELSE
          ws%mos_kibz(:, :) = CMPLX(cre(:, :), cim(:, :), KIND=dp)
       END IF
+      DEALLOCATE (cre)
+      IF (.NOT. real_only) DEALLOCATE (cim)
 
       ws%nmo_active = 0
       DO imo = 1, nmo

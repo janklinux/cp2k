@@ -11,7 +11,7 @@ and what is queued next. Keep it in sync with the code; do not let the
 | Path                                  | Trigger                                                       | Works at | Notes                                                                  |
 |---------------------------------------|---------------------------------------------------------------|---------:|------------------------------------------------------------------------|
 | spglib DM reconstruction              | `kpoint%use_spglib_dm` and `kpoint%scoord` associated         | any rank | replicate-rotate-scatter via `group%sum(pmat)` inside `dbcsr_to_dense_complex` |
-| spglib MO rotation                    | `use_spglib` plus single-rank DBCSR plus `(.NOT. do_ext)`     |    rank 1 | needs flat IBZ MO FM tile; rank > 1 falls through to DM path           |
+| spglib MO rotation                    | `use_spglib` plus `my_kpgrp` plus `kp%mos` plus `(.NOT. do_ext)` | any rank | `cp_fm_get_submatrix` replicates IBZ MO FM tile on every rank, then the per-MO ZGEMM runs redundantly |
 | spglib IBZ generation (`cryssym.F`)   | `SYMMETRY ON` in `&KPOINTS`                                   | any rank | `spg_get_ir_reciprocal_mesh`; populates `csym%rt/vt/f0/nrtot/ibrot` |
 | legacy `symtrans` fallback            | dispatch with neither `use_spglib` nor `use_mo_rot`           |    rank 1 | aborts at `kpoint_methods.F:2130` for distributed matrices; do not rely on it |
 
@@ -30,8 +30,9 @@ Two dirs in `tests/QS/`, both tagged `spglib`:
 Latest local run on `cp2k.psmp`, gfortran 14.2, this branch:
 
 ```
-mpiranks=1   52 / 52 OK   ( 5 min)
-mpiranks=4   52 / 52 OK   ( 2 min)
+mpiranks=1   52 / 52 OK   (8 min)
+mpiranks=4   52 / 52 OK   (3 min)
+mpiranks=12  52 / 52 OK   (3 min)
 ```
 
 ## Implementation pointers
@@ -52,12 +53,11 @@ mpiranks=4   52 / 52 OK   ( 2 min)
 
 In rough order:
 
-1. **Multi-rank MO path.** Generalise `spglib_mo_workspace_init` to accept a distributed FM (gather to dense via `cp_fm_get_submatrix` or a transpose-reduce; run the per-MO rotation locally; redistribute on write). Lift the `(spglib_numnodes == 1)` gate from `use_mo_rot` once that lands.
-2. **Distributed `D~ P D~^dagger`.** The current DM path replicates the full dense P on every rank (memory O(N_basis^2)). Move to a ScaLAPACK / `cp_fm`-distributed product when memory becomes the bottleneck (large primitive cells, dense basis sets).
-3. **Retire the legacy `symtrans` multi-rank abort.** Once the DM path covers every code site that currently dispatches to `symtrans`, replace the abort at `kpoint_methods.F:2130` with a hard fallback to the spglib path or remove the branch.
-4. **Cover the missing point groups.** Regtests skip 622, m-3, 432 because the discovery pass on Materials Project did not return a single small stable representative for those groups. Re-run `discover.py` with a larger candidate window if needed.
-5. **Coverage extensions.** Aux-fit (`for_aux_fit=.TRUE.`) and the energy-weighted DM via `pmat_ext` (`do_ext=.TRUE.`) currently use the DM path; spot-check that the regtests touch both branches, otherwise add a small dedicated case.
-6. **Performance baseline.** Once the distributed product lands, take wall-time numbers vs the legacy path on a representative cell (e.g. the 80-atom NASICON used in the battery campaign) so the trade-off is documented.
+1. **Distributed `D~ P D~^dagger`.** The current DM path replicates the full dense P on every rank (memory O(N_basis^2)). Move to a ScaLAPACK / `cp_fm`-distributed product when memory becomes the bottleneck (large primitive cells, dense basis sets). The same observation applies to the MO path, which now replicates the (nao, nmo) coefficient matrix on every rank.
+2. **Retire the legacy `symtrans` multi-rank abort.** Once the DM path covers every code site that currently dispatches to `symtrans`, replace the abort at `kpoint_methods.F:2130` with a hard fallback to the spglib path or remove the branch.
+3. **Cover the missing point groups.** Regtests skip 622, m-3, 432 because the discovery pass on Materials Project did not return a single small stable representative for those groups. Re-run `discover.py` with a larger candidate window if needed.
+4. **Coverage extensions.** Aux-fit (`for_aux_fit=.TRUE.`) and the energy-weighted DM via `pmat_ext` (`do_ext=.TRUE.`) currently use the DM path; spot-check that the regtests touch both branches, otherwise add a small dedicated case.
+5. **Performance baseline.** Once the distributed products land, take wall-time numbers vs the legacy path on a representative cell (e.g. the 80-atom NASICON used in the battery campaign) so the trade-off is documented.
 
 ## Source bench
 
