@@ -28,12 +28,12 @@ MODULE kpoint_density_spglib
    USE cp_dbcsr_api,                    ONLY: &
         dbcsr_get_block_p, dbcsr_get_info, dbcsr_get_matrix_type, dbcsr_iterator_blocks_left, &
         dbcsr_iterator_next_block, dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, &
-        dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry, &
-        dbcsr_distribution_type, dbcsr_distribution_get
+        dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry
    USE cp_fm_types,                     ONLY: cp_fm_get_info, cp_fm_type
    USE kinds,                           ONLY: dp
    USE kpoint_types,                    ONLY: kpoint_env_type, kpoint_sym_type, kpoint_type
    USE mathconstants,                   ONLY: twopi
+   USE message_passing,                 ONLY: mp_comm_type
    USE qs_mo_types,                     ONLY: get_mo_set, mo_set_type
 #include "./base/base_uses.f90"
 
@@ -105,9 +105,10 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Initialise a per-IBZ-k workspace and pull the IBZ density matrix
 !>        from (rpmat, cpmat) into the dense complex pmat_kibz.
-!> \par   Single-node restriction. The caller is responsible for not invoking
-!>        this routine when numnodes(rpmat) > 1; the legacy symtrans path has
-!>        the same restriction (kpoint_methods.F:1957).
+!> \par   Multi-rank: dbcsr_to_dense_complex replicates the dense P(k_IBZ)
+!>        across the DBCSR MPI group, so the rotation runs redundantly on
+!>        every rank and dense_complex_to_dbcsr writes each rank's owned
+!>        blocks. The legacy symtrans path is bypassed.
 ! **************************************************************************************************
    SUBROUTINE spglib_dm_workspace_init(ws, kpoint, rpmat, cpmat, real_only)
       TYPE(spglib_dm_workspace_type), INTENT(OUT)          :: ws
@@ -115,22 +116,11 @@ CONTAINS
       TYPE(dbcsr_type), POINTER                          :: rpmat, cpmat
       LOGICAL, INTENT(IN)                                :: real_only
 
-      INTEGER                                            :: numnodes
-      TYPE(dbcsr_distribution_type)                      :: dist
-
       CPASSERT(ASSOCIATED(kpoint))
       CPASSERT(ASSOCIATED(kpoint%scoord))
       CPASSERT(ASSOCIATED(kpoint%atype))
       CPASSERT(ASSOCIATED(kpoint%ibrot))
       CPASSERT(ASSOCIATED(kpoint%kind_rotmat))
-
-      CALL dbcsr_get_info(rpmat, distribution=dist)
-      CALL dbcsr_distribution_get(dist, numnodes=numnodes)
-      IF (numnodes /= 1) THEN
-         CALL cp_abort(__LOCATION__, &
-                       "kpoint_density_spglib: distributed DBCSR not yet supported, "// &
-                       "single MPI rank required (single-node validation per project rule)")
-      END IF
 
       ws%natom = SIZE(kpoint%atype)
       ALLOCATE (ws%atom_first(ws%natom + 1), ws%atom_size(ws%natom))
@@ -895,6 +885,7 @@ CONTAINS
       LOGICAL                                            :: rsym, csym
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: blk
       TYPE(dbcsr_iterator_type)                          :: iter
+      TYPE(mp_comm_type)                                 :: group
 
       pmat = (0.0_dp, 0.0_dp)
 
@@ -929,6 +920,12 @@ CONTAINS
          END DO
          CALL dbcsr_iterator_stop(iter)
       END IF
+
+      ! Replicate the dense matrix across the DBCSR MPI group so every rank
+      ! has the full P(k_IBZ). Each rank contributed only its locally-owned
+      ! blocks above; the sum collects them on every rank.
+      CALL dbcsr_get_info(rpmat, group=group)
+      IF (group%num_pe > 1) CALL group%sum(pmat)
    END SUBROUTINE dbcsr_to_dense_complex
 
 ! **************************************************************************************************
