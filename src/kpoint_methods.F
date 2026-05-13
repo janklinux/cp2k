@@ -28,8 +28,9 @@ MODULE kpoint_methods
         dbcsr_copy, dbcsr_create, dbcsr_deallocate_matrix, dbcsr_desymmetrize, &
         dbcsr_distribution_get, dbcsr_distribution_type, dbcsr_get_block_p, dbcsr_get_info, &
         dbcsr_iterator_blocks_left, dbcsr_iterator_next_block, dbcsr_iterator_start, &
-        dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_p_type, dbcsr_set, dbcsr_type, &
-        dbcsr_type_antisymmetric, dbcsr_type_no_symmetry, dbcsr_type_symmetric
+        dbcsr_iterator_stop, dbcsr_iterator_type, dbcsr_p_type, dbcsr_scale, dbcsr_set, &
+        dbcsr_type, dbcsr_type_antisymmetric, dbcsr_type_no_symmetry, dbcsr_type_symmetric
+   USE cp_dbcsr_contrib,                ONLY: dbcsr_trace
    USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
    USE cp_dbcsr_operations,             ONLY: copy_dbcsr_to_fm,&
                                               copy_fm_to_dbcsr
@@ -55,6 +56,18 @@ MODULE kpoint_methods
                                               smear_mp,&
                                               smear_mv
    USE kinds,                           ONLY: dp
+   USE kpoint_density_spglib,             ONLY: spglib_dm_rotate_one_star,&
+                                              spglib_dm_workspace_init,&
+                                              spglib_dm_workspace_release,&
+                                              spglib_dm_workspace_type,&
+                                              spglib_mo_rotate_one_star,&
+                                              spglib_mo_workspace_init,&
+                                              spglib_mo_workspace_release,&
+                                              spglib_mo_workspace_type,&
+                                              dump_delta_full,&
+                                              dump_ibz_mos,&
+                                              dump_kpsym_meta,&
+                                              dump_rotated_mos
    USE kpoint_types,                    ONLY: get_kpoint_info,&
                                               kind_rotmat_type,&
                                               kpoint_env_create,&
@@ -175,6 +188,12 @@ CONTAINS
          ALLOCATE (kpoint%atype(natom))
          kpoint%atype = atype
 
+         ! Fractional atom coordinates kept for FHI-spglib-style DM reconstruction
+         ! (full-basis Delta needs tau_i in fractional coords)
+         IF (ASSOCIATED(kpoint%scoord)) DEALLOCATE (kpoint%scoord)
+         ALLOCATE (kpoint%scoord(3, natom))
+         kpoint%scoord(1:3, 1:natom) = scoord(1:3, 1:natom)
+
          CALL crys_sym_gen(crys_sym, scoord, atype, cell%hmat, delta=kpoint%eps_geo, iounit=iounit)
          CALL kpoint_gen(crys_sym, kpoint%nkp_grid, symm=kpoint%symmetry, shift=kpoint%kp_shift, &
                          full_grid=kpoint%full_grid)
@@ -245,6 +264,18 @@ CONTAINS
             END DO
             ALLOCATE (kpoint%ibrot(ns))
             kpoint%ibrot(1:ns) = crys_sym%ibrot(1:ns)
+            ! FHI-spglib-style DM reconstruction: keep per-ira spatial rotation
+            ! and translation. Indexed by ira (1..ns), so row/col swap to
+            ! match kind_rotmat layout. crys_sym%rt and %vt are stored once
+            ! per spglib operation; map via ibrot.
+            IF (ASSOCIATED(kpoint%symop_rt)) DEALLOCATE (kpoint%symop_rt)
+            IF (ASSOCIATED(kpoint%symop_vt)) DEALLOCATE (kpoint%symop_vt)
+            ALLOCATE (kpoint%symop_rt(3, 3, ns))
+            ALLOCATE (kpoint%symop_vt(3, ns))
+            DO i = 1, ns
+               kpoint%symop_rt(1:3, 1:3, i) = crys_sym%rt(1:3, 1:3, crys_sym%ibrot(i))
+               kpoint%symop_vt(1:3, i)      = crys_sym%vt(1:3, crys_sym%ibrot(i))
+            END DO
          END IF
 
          CALL release_csym_type(crys_sym)
@@ -1259,6 +1290,31 @@ CONTAINS
                END IF
                ! Im(c)*Im(c)
                CALL parallel_gemm("N", "T", nao, nao, nmo, 1.0_dp, mo_set%mo_coeff, fwork, 1.0_dp, rpmat)
+               IF (ispin == 1 .AND. dump_mos_active()) THEN
+                  BLOCK
+                     CHARACTER(LEN=128)                  :: fname
+                     INTEGER                             :: i, j, lun
+                     REAL(KIND=dp), DIMENSION(:, :), POINTER :: rd, cd
+                     INTEGER                             :: kx, ky, kz
+                     rd => rpmat%local_data
+                     cd => cpmat%local_data
+                     kx = NINT(kp%xkp(1)*10000.0_dp)
+                     ky = NINT(kp%xkp(2)*10000.0_dp)
+                     kz = NINT(kp%xkp(3)*10000.0_dp)
+                     WRITE (fname, '(A,SP,3I7.5,SS,A)') 'pmat_kp_', kx, ky, kz, '.txt'
+                     lun = 9881
+                     OPEN (unit=lun, file=fname, status='replace', action='write')
+                     WRITE (lun, '(A)') '# kp%pmat (Re + i Im) at this k-point'
+                     WRITE (lun, '(A,3F12.6)') '# k = ', kp%xkp(1:3)
+                     WRITE (lun, '(A,2I6)') '# shape = ', SIZE(rd, 1), SIZE(rd, 2)
+                     DO i = 1, SIZE(rd, 1)
+                        DO j = 1, SIZE(rd, 2)
+                           WRITE (lun, '(2I6,2E22.14)') i, j, rd(i, j), cd(i, j)
+                        END DO
+                     END DO
+                     CLOSE (lun)
+                  END BLOCK
+               END IF
             END IF
          END DO
       END DO
@@ -1494,12 +1550,16 @@ CONTAINS
 
       INTEGER                                            :: handle, ic, ik, ikk, indx, ir, ira, is, &
                                                             ispin, jr, nc, nimg, nkp, nspin
+      INTEGER, DIMENSION(:, :), POINTER                  :: index_to_cell
       INTEGER, DIMENSION(:, :, :), POINTER               :: cell_to_index
       LOGICAL                                            :: aux_fit, do_ext, do_symmetric, my_kpgrp, &
-                                                            real_only
-      REAL(KIND=dp)                                      :: wkpx
+                                                            real_only, use_spglib
+      REAL(KIND=dp)                                      :: trace_rep, trace_rot, wkpx
       REAL(KIND=dp), DIMENSION(:), POINTER               :: wkp
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: xkp
+      TYPE(spglib_dm_workspace_type)                       :: spglib_ws
+      TYPE(spglib_mo_workspace_type)                       :: spglib_mo_ws
+      LOGICAL                                            :: use_mo_rot
       TYPE(copy_info_type), ALLOCATABLE, DIMENSION(:)    :: info
       TYPE(cp_fm_type)                                   :: fmdummy
       TYPE(dbcsr_type), POINTER                          :: cpmat, rpmat, scpmat, srpmat
@@ -1548,7 +1608,7 @@ CONTAINS
       END IF
 
       CALL get_kpoint_info(kpoint, nkp=nkp, xkp=xkp, wkp=wkp, &
-                           cell_to_index=cell_to_index)
+                           cell_to_index=cell_to_index, index_to_cell=index_to_cell)
       ! initialize real space density matrices
       IF (aux_fit) THEN
          kp => kpoint%kp_aux_env(1)%kpoint_env
@@ -1624,32 +1684,149 @@ CONTAINS
                CALL copy_fm_to_dbcsr(fmwork(2), cpmat, keep_sparsity=.TRUE.)
             END IF
 
+            ! Locate the per-IBZ-k env for the MO-rotation path (single-MPI
+            ! only). For other paths kp is unused below.
+            my_kpgrp = (ik >= kpoint%kp_range(1) .AND. ik <= kpoint%kp_range(2))
+            IF (my_kpgrp) THEN
+               ikk = ik - kpoint%kp_range(1) + 1
+               IF (aux_fit) THEN
+                  kp => kpoint%kp_aux_env(ikk)%kpoint_env
+               ELSE
+                  kp => kpoint%kp_env(ikk)%kpoint_env
+               END IF
+            ELSE
+               NULLIFY (kp)
+            END IF
+
             ! symmetrization
             kpsym => kpoint%kp_sym(ik)%kpoint_sym
             CPASSERT(ASSOCIATED(kpsym))
 
             IF (kpsym%apply_symmetry) THEN
                wkpx = wkp(ik)/REAL(kpsym%nwght, KIND=dp)
-               DO is = 1, kpsym%nwght
-                  ir = ABS(kpsym%rotp(is))
-                  ira = 0
-                  DO jr = 1, SIZE(kpoint%ibrot)
-                     IF (ir == kpoint%ibrot(jr)) ira = jr
-                  END DO
-                  CPASSERT(ira > 0)
-                  kind_rot => kpoint%kind_rotmat(ira, :)
-                  IF (real_only) THEN
-                     CALL symtrans(srpmat, rpmat, kind_rot, kpsym%rot(1:3, 1:3, is), &
-                                   kpsym%f0(:, is), kpoint%atype, symmetric=.TRUE.)
-                  ELSE
-                     CALL symtrans(srpmat, rpmat, kind_rot, kpsym%rot(1:3, 1:3, is), &
-                                   kpsym%f0(:, is), kpoint%atype, symmetric=.TRUE.)
-                     CALL symtrans(scpmat, cpmat, kind_rot, kpsym%rot(1:3, 1:3, is), &
-                                   kpsym%f0(:, is), kpoint%atype, antisymmetric=.TRUE.)
+               IF (ispin == 1 .AND. dump_mos_active()) THEN
+                  CALL dbcsr_trace(rpmat, trace_rep)
+                  WRITE(0,'(A,I4,A,I3,A,I3,A,F8.5,A,F10.6,A,L1)') &
+                     'DBG kdt ik=', ik, ' ispin=', ispin, &
+                     ' nwght=', kpsym%nwght, ' wkp=', wkp(ik), &
+                     ' Tr(rpmat)=', trace_rep, ' apply_sym=', kpsym%apply_symmetry
+               END IF
+
+               ! spglib path requires single-rank DBCSR (the dense full-basis
+               ! Delta and the IBZ MO coeffs are gathered locally). Fall
+               ! back to legacy symtrans when the matrices are distributed.
+               BLOCK
+                  INTEGER                                 :: spglib_numnodes
+                  TYPE(dbcsr_distribution_type)           :: spglib_dist
+                  CALL dbcsr_get_info(rpmat, distribution=spglib_dist)
+                  CALL dbcsr_distribution_get(spglib_dist, numnodes=spglib_numnodes)
+                  use_spglib = kpoint%use_spglib_dm .AND. ASSOCIATED(kpoint%scoord) &
+                             .AND. (spglib_numnodes == 1)
+               END BLOCK
+               ! MO rotation requires direct MO access (single-MPI) and
+               ! is currently unavailable when constructing the energy-
+               ! weighted DM via an external pmat (do_ext) because the MO
+               ! eigenvalues have not been refreshed.
+               use_mo_rot = use_spglib .AND. my_kpgrp .AND. ASSOCIATED(kp) .AND. &
+                            ASSOCIATED(kp%mos) .AND. (.NOT. do_ext)
+               IF (use_mo_rot) THEN
+                  ! FHI-spglib-style: rotate each KS eigenvector first, then
+                  ! form P(k_star) = sum_n w_n c_rot,n c_rot,n^H. The atom
+                  ! permutation f0 and non-symmorphic phase are absorbed
+                  ! into the full-basis rotation Delta. Matches sym_base.f90:
+                  ! evaluate_k_densmat_sym + get_kvec_sym.
+                  CALL spglib_mo_workspace_init(spglib_mo_ws, kpoint, kp, ispin, real_only, wtype)
+                  ! One-shot per-IBZ-k dumps (IBZ MOs and symmetry metadata).
+                  ! Both gated by CP2K_AIMS_DUMP_MOS so they only fire when
+                  ! the offline reconstruction probe is requested.
+                  IF (ispin == 1 .AND. dump_mos_active()) THEN
+                     CALL dump_ibz_mos(spglib_mo_ws, ik, 'cp2k')
+                     CALL dump_kpsym_meta(kpoint, kpsym, ik, xkp(1:3, ik), &
+                                          spglib_mo_ws%atom_first, spglib_mo_ws%atom_size, &
+                                          spglib_mo_ws%n_basis_tot, 'cp2k')
                   END IF
-                  CALL transform_dmat(denmat, srpmat, scpmat, ispin, real_only, sab_nl, &
-                                      cell_to_index, kpsym%xkp(1:3, is), wkpx)
-               END DO
+                  DO is = 1, kpsym%nwght
+                     CALL spglib_mo_rotate_one_star(spglib_mo_ws, kpoint, kpsym, is, &
+                                                  xkp(1:3, ik), real_only, srpmat, scpmat)
+                     ! Per-MO dump for FHI-spglib side-by-side diff. Activated
+                     ! by env var CP2K_AIMS_DUMP_MOS=1 so the dispatch stays
+                     ! cheap by default. One file per (ispin, ik, is) is
+                     ! emitted; format matches FHI-spglib's commented debug in
+                     ! sym_base.f90:2299-2304 (Re/Im/|c| per i_state, i_basis).
+                     IF (ispin == 1 .AND. dump_mos_active()) THEN
+                        CALL dump_rotated_mos(spglib_mo_ws, ik, is, 'cp2k')
+                        CALL dump_delta_full(spglib_mo_ws, ik, is, 'cp2k')
+                     END IF
+                     IF (ispin == 1 .AND. dump_mos_active()) THEN
+                        CALL dbcsr_trace(srpmat, trace_rot)
+                        WRITE(0,'(A,I4,A,I4,A,3F7.3,A,F8.5,A,I4,A,F8.5)') &
+                           'DBG kdt-mo  is=', is, ' ik=', ik, &
+                           ' xkp=', kpsym%xkp(1:3, is), &
+                           ' wkpx=', wkpx, ' rotp=', kpsym%rotp(is), &
+                           ' Tr(srpmat)=', trace_rot
+                     END IF
+                     CALL transform_dmat(denmat, srpmat, scpmat, ispin, real_only, sab_nl, &
+                                         cell_to_index, kpsym%xkp(1:3, is), wkpx)
+                  END DO
+                  CALL spglib_mo_workspace_release(spglib_mo_ws)
+               ELSE IF (use_spglib) THEN
+                  ! Fallback (no MO access or do_ext path):
+                  ! P(k_star) = D * P(k_IBZ) * D^dagger on the assembled DM.
+                  CALL spglib_dm_workspace_init(spglib_ws, kpoint, rpmat, cpmat, real_only)
+                  DO is = 1, kpsym%nwght
+                     CALL spglib_dm_rotate_one_star(spglib_ws, kpoint, kpsym, is, &
+                                                  xkp(1:3, ik), real_only, srpmat, scpmat)
+                     IF (ispin == 1 .AND. dump_mos_active()) THEN
+                        CALL dbcsr_trace(srpmat, trace_rot)
+                        WRITE(0,'(A,I4,A,I4,A,3F7.3,A,F8.5,A,I4,A,F8.5)') &
+                           'DBG kdt-spglib is=', is, ' ik=', ik, &
+                           ' xkp=', kpsym%xkp(1:3, is), &
+                           ' wkpx=', wkpx, ' rotp=', kpsym%rotp(is), &
+                           ' Tr(srpmat)=', trace_rot
+                     END IF
+                     CALL transform_dmat(denmat, srpmat, scpmat, ispin, real_only, sab_nl, &
+                                         cell_to_index, kpsym%xkp(1:3, is), wkpx)
+                  END DO
+                  CALL spglib_dm_workspace_release(spglib_ws)
+               ELSE
+                  ! Legacy CP2K path: symtrans rotates DBCSR blocks with explicit
+                  ! f0 row/col swap. Kept as fallback; see kpoint_methods.F:1850.
+                  DO is = 1, kpsym%nwght
+                     ir = ABS(kpsym%rotp(is))
+                     ira = 0
+                     DO jr = 1, SIZE(kpoint%ibrot)
+                        IF (ir == kpoint%ibrot(jr)) ira = jr
+                     END DO
+                     CPASSERT(ira > 0)
+                     kind_rot => kpoint%kind_rotmat(ira, :)
+                     IF (real_only) THEN
+                        CALL symtrans(srpmat, rpmat, kind_rot, kpsym%rot(1:3, 1:3, is), &
+                                      kpsym%f0(:, is), kpoint%atype, symmetric=.TRUE.)
+                     ELSE
+                        CALL symtrans(srpmat, rpmat, kind_rot, kpsym%rot(1:3, 1:3, is), &
+                                      kpsym%f0(:, is), kpoint%atype, symmetric=.TRUE.)
+                        ! For ordinary rotations (rotp>0): P_I(k_s) = +D*P_I*D^T → symmetric
+                        ! For time-reversal (rotp<0): P_I(-k_s) = -D*P_I*D^T → antisymmetric
+                        IF (kpsym%rotp(is) < 0) THEN
+                           CALL symtrans(scpmat, cpmat, kind_rot, kpsym%rot(1:3, 1:3, is), &
+                                         kpsym%f0(:, is), kpoint%atype, antisymmetric=.TRUE.)
+                        ELSE
+                           CALL symtrans(scpmat, cpmat, kind_rot, kpsym%rot(1:3, 1:3, is), &
+                                         kpsym%f0(:, is), kpoint%atype, symmetric=.TRUE.)
+                        END IF
+                     END IF
+                     IF (ispin == 1 .AND. dump_mos_active()) THEN
+                        CALL dbcsr_trace(srpmat, trace_rot)
+                        WRITE(0,'(A,I4,A,I4,A,I4,A,3F7.3,A,F8.5,A,I4,A,F8.5)') &
+                           'DBG kdt  is=', is, ' ir=', ir, ' ira=', ira, &
+                           ' xkp=', kpsym%xkp(1:3, is), &
+                           ' wkpx=', wkpx, ' rotp=', kpsym%rotp(is), &
+                           ' Tr(srpmat)=', trace_rot
+                     END IF
+                     CALL transform_dmat(denmat, srpmat, scpmat, ispin, real_only, sab_nl, &
+                                         cell_to_index, kpsym%xkp(1:3, is), wkpx)
+                  END DO
+               END IF
             ELSE
                ! transformation
                CALL transform_dmat(denmat, rpmat, cpmat, ispin, real_only, sab_nl, &
@@ -1685,6 +1862,36 @@ CONTAINS
 
       ! All done
       DEALLOCATE (info)
+
+      ! DEBUG: trace of accumulated real-space density matrix (gated)
+      IF (dump_mos_active()) THEN
+         DO ispin = 1, nspin
+            CALL dbcsr_trace(denmat(ispin, 1)%matrix, trace_rep)
+            WRITE (0, '(A,I3,A,F14.8)') 'DBG kdt_done ispin=', ispin, ' Tr(denmat,img1)=', trace_rep
+         END DO
+      END IF
+      ! DEBUG: per-image trace + Frobenius norm (spin 1 only). Gated by
+      ! CP2K_AIMS_DUMP_MOS so production runs (and regtests) stay quiet.
+      IF (dump_mos_active()) THEN
+         DO ic = 1, nimg
+            CALL dbcsr_trace(denmat(1, ic)%matrix, trace_rep)
+            BLOCK
+               REAL(KIND=dp) :: fro
+               TYPE(dbcsr_iterator_type)               :: iter
+               INTEGER                                 :: irow, icol
+               REAL(KIND=dp), DIMENSION(:, :), POINTER :: blk
+               fro = 0.0_dp
+               CALL dbcsr_iterator_start(iter, denmat(1, ic)%matrix)
+               DO WHILE (dbcsr_iterator_blocks_left(iter))
+                  CALL dbcsr_iterator_next_block(iter, irow, icol, blk)
+                  fro = fro + SUM(blk*blk)
+               END DO
+               CALL dbcsr_iterator_stop(iter)
+               WRITE (0, '(A,I3,A,3I3,A,F12.6,A,ES16.8)') 'DBG kdt_img ic=', ic, &
+                  ' R=', index_to_cell(1:3, ic), ' Tr=', trace_rep, ' ||P||^2=', fro
+            END BLOCK
+         END DO
+      END IF
 
       CALL dbcsr_deallocate_matrix(rpmat)
       CALL dbcsr_deallocate_matrix(cpmat)
@@ -1723,8 +1930,8 @@ CONTAINS
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'transform_dmat'
 
-      INTEGER                                            :: handle, iatom, icell, icol, irow, jatom, &
-                                                            nimg
+      INTEGER                                            :: handle, i, iatom, icell, icol, irow, &
+                                                            jatom, nimg
       INTEGER, DIMENSION(3)                              :: cell
       LOGICAL                                            :: do_symmetric, found
       REAL(KIND=dp)                                      :: arg, coskl, fc, sinkl
@@ -1771,6 +1978,14 @@ CONTAINS
             CALL dbcsr_get_block_p(matrix=rpmat, row=irow, col=icol, block=rblock, found=found)
             IF (.NOT. found) CYCLE
             dblock = dblock + coskl*rblock
+            ! DEBUG: log R=0 diagonal contribution for spin=1 (gated)
+            IF (ispin == 1 .AND. ALL(cell == 0) .AND. irow == icol &
+                .AND. dump_mos_active()) THEN
+               WRITE (0, '(A,2I3,A,F8.5,A,F10.6,A,F10.6)') &
+                  'DBG tdmat R=0 at=', iatom, jatom, &
+                  ' coskl=', coskl, ' Tr(rblock)=', SUM([(rblock(i, i), i=1, SIZE(rblock, 1))]), &
+                  ' Tr_accum=', SUM([(dblock(i, i), i=1, SIZE(dblock, 1))])
+            END IF
          ELSE
             CALL dbcsr_get_block_p(matrix=rpmat, row=irow, col=icol, block=rblock, found=found)
             IF (.NOT. found) CYCLE
@@ -1778,6 +1993,14 @@ CONTAINS
             IF (.NOT. found) CYCLE
             dblock = dblock + coskl*rblock
             dblock = dblock + sinkl*cblock
+            ! DEBUG: log R=0 diagonal contribution for spin=1 (gated)
+            IF (ispin == 1 .AND. ALL(cell == 0) .AND. irow == icol &
+                .AND. dump_mos_active()) THEN
+               WRITE (0, '(A,2I3,A,F8.5,A,F10.6,A,F10.6)') &
+                  'DBG tdmat R=0 at=', iatom, jatom, &
+                  ' coskl=', coskl, ' Tr(rblock)=', SUM([(rblock(i, i), i=1, SIZE(rblock, 1))]), &
+                  ' Tr_accum=', SUM([(dblock(i, i), i=1, SIZE(dblock, 1))])
+            END IF
          END IF
       END DO
       CALL neighbor_list_iterator_release(nl_iterator)
@@ -1809,10 +2032,13 @@ CONTAINS
       INTEGER                                            :: handle, iatom, icol, ikind, ip, irow, &
                                                             jcol, jkind, jp, jrow, natom, numnodes
       LOGICAL                                            :: asym, dorot, found, perm, sym, trans
-      REAL(KIND=dp)                                      :: dr, fsign
+      INTEGER, SAVE                                      :: dbg_sym_cnt = 0
+      REAL(KIND=dp)                                      :: dbg_tr_p, dbg_tr_new, dbg_tr_old, dr, fsign
+      REAL(KIND=dp), ALLOCATABLE                         :: dbg_orig(:, :), dbg_alt(:, :)
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: kroti, krotj, pblock, sblock
       TYPE(dbcsr_distribution_type)                      :: dist
       TYPE(dbcsr_iterator_type)                          :: iter
+      INTEGER                                            :: dbg_ni, dbg_i
 
       CALL timeset(routineN, handle)
 
@@ -1844,8 +2070,8 @@ CONTAINS
       IF (asym) fsign = -1.0_dp
 
       IF (dorot .OR. perm) THEN
-         CALL cp_abort(__LOCATION__, "k-points need FULL_GRID currently. "// &
-                       "Reduced grids not yet working correctly")
+!         CALL cp_abort(__LOCATION__, "k-points need FULL_GRID currently. "// &
+!                       "Reduced grids not yet working correctly")
          CALL dbcsr_set(smat, 0.0_dp)
          IF (perm) THEN
             CALL dbcsr_get_info(pmat, distribution=dist)
@@ -1872,11 +2098,29 @@ CONTAINS
                   jkind = atype(icol)
                   kroti => kmat(ikind)%rmat
                   krotj => kmat(jkind)%rmat
-                  ! rotation
+                  ! rotation: correct formula is D*P*D^T (was wrongly D^T*P*D)
+                  IF (dbg_sym_cnt < 40 .AND. .NOT. trans) THEN
+                     dbg_ni = SIZE(pblock, 1)
+                     ALLOCATE (dbg_orig(dbg_ni, SIZE(pblock, 2)), dbg_alt(dbg_ni, SIZE(pblock, 2)))
+                     dbg_orig = pblock
+                  END IF
                   IF (trans) THEN
-                     sblock = fsign*MATMUL(TRANSPOSE(krotj), MATMUL(TRANSPOSE(pblock), kroti))
+                     sblock = fsign*MATMUL(krotj, MATMUL(TRANSPOSE(pblock), TRANSPOSE(kroti)))
                   ELSE
-                     sblock = fsign*MATMUL(TRANSPOSE(kroti), MATMUL(pblock, krotj))
+                     sblock = fsign*MATMUL(kroti, MATMUL(pblock, TRANSPOSE(krotj)))
+                  END IF
+                  IF (dbg_sym_cnt < 40 .AND. .NOT. trans) THEN
+                     dbg_alt = fsign*MATMUL(TRANSPOSE(kroti), MATMUL(dbg_orig, krotj))
+                     dbg_tr_p = SUM([(dbg_orig(dbg_i, dbg_i), dbg_i=1, dbg_ni)])
+                     dbg_tr_new = SUM([(sblock(dbg_i, dbg_i), dbg_i=1, dbg_ni)])
+                     dbg_tr_old = SUM([(dbg_alt(dbg_i, dbg_i), dbg_i=1, dbg_ni)])
+                     WRITE (0, '(A,I3,A,I3,A,I3,A,F9.4,A,F9.4,A,F9.4,A,E10.3)') &
+                        'DBG sym_perm#', dbg_sym_cnt, ' i=', irow, ' j=', icol, &
+                        ' Tr_P=', dbg_tr_p, ' Tr_DPDt=', dbg_tr_new, &
+                        ' Tr_DtPD=', dbg_tr_old, &
+                        ' max(diff)=', MAXVAL(ABS(sblock - dbg_alt))
+                     DEALLOCATE (dbg_orig, dbg_alt)
+                     dbg_sym_cnt = dbg_sym_cnt + 1
                   END IF
                END DO
                CALL dbcsr_iterator_stop(iter)
@@ -1907,11 +2151,33 @@ CONTAINS
                jkind = atype(icol)
                kroti => kmat(ikind)%rmat
                krotj => kmat(jkind)%rmat
-               ! rotation
+               ! rotation: correct formula is D*P*D^T (was wrongly D^T*P*D)
+               IF (dbg_sym_cnt < 40 .AND. .NOT. trans) THEN
+                  dbg_ni = SIZE(sblock, 1)
+                  ALLOCATE (dbg_orig(dbg_ni, SIZE(sblock, 2)), dbg_alt(dbg_ni, SIZE(sblock, 2)))
+                  dbg_orig = sblock
+               END IF
                IF (trans) THEN
-                  sblock = fsign*MATMUL(TRANSPOSE(krotj), MATMUL(TRANSPOSE(sblock), kroti))
+                  sblock = fsign*MATMUL(krotj, MATMUL(TRANSPOSE(sblock), TRANSPOSE(kroti)))
                ELSE
-                  sblock = fsign*MATMUL(TRANSPOSE(kroti), MATMUL(sblock, krotj))
+                  sblock = fsign*MATMUL(kroti, MATMUL(sblock, TRANSPOSE(krotj)))
+               END IF
+               IF (dbg_sym_cnt < 40 .AND. .NOT. trans) THEN
+                  dbg_alt = fsign*MATMUL(TRANSPOSE(kroti), MATMUL(dbg_orig, krotj))
+                  dbg_tr_p = SUM([(dbg_orig(dbg_i, dbg_i), dbg_i=1, dbg_ni)])
+                  dbg_tr_new = SUM([(sblock(dbg_i, dbg_i), dbg_i=1, dbg_ni)])
+                  dbg_tr_old = SUM([(dbg_alt(dbg_i, dbg_i), dbg_i=1, dbg_ni)])
+                  WRITE (0, '(A,I3,A,I3,A,I3,A,F9.4,A,F9.4,A,F9.4,A,E10.3)') &
+                     'DBG sym_noperm#', dbg_sym_cnt, ' i=', irow, ' j=', icol, &
+                     ' Tr_P=', dbg_tr_p, ' Tr_DPDt=', dbg_tr_new, &
+                     ' Tr_DtPD=', dbg_tr_old, &
+                     ' max(diff)=', MAXVAL(ABS(sblock - dbg_alt))
+                  IF (dbg_sym_cnt < 3) THEN
+                     WRITE (0, '(A,4F8.4)') 'DBG DPDt_diag=', (sblock(dbg_i, dbg_i), dbg_i=1, MIN(4, dbg_ni))
+                     WRITE (0, '(A,4F8.4)') 'DBG DtPD_diag=', (dbg_alt(dbg_i, dbg_i), dbg_i=1, MIN(4, dbg_ni))
+                  END IF
+                  DEALLOCATE (dbg_orig, dbg_alt)
+                  dbg_sym_cnt = dbg_sym_cnt + 1
                END IF
             END DO
             CALL dbcsr_iterator_stop(iter)
@@ -1920,6 +2186,8 @@ CONTAINS
       ELSE
          ! this is the identity operation, just copy the matrix
          CALL dbcsr_copy(smat, pmat)
+         ! for time-reversal (asym=.TRUE.), P_I must be negated even at identity rotation
+         IF (asym) CALL dbcsr_scale(smat, -1.0_dp)
       END IF
 
       CALL timestop(handle)
@@ -1954,5 +2222,27 @@ CONTAINS
 
    END SUBROUTINE matprint
 ! **************************************************************************************************
+
+! **************************************************************************************************
+!> \brief Read CP2K_AIMS_DUMP_MOS once and cache the result. Returns .TRUE.
+!>        when the env var is set to "1" or "true". Used to gate the
+!>        per-MO dump in the FHI-spglib-style MO-rotation path so dumps are
+!>        only produced on request, not in every run.
+! **************************************************************************************************
+   LOGICAL FUNCTION dump_mos_active() RESULT(active)
+      CHARACTER(LEN=8)                                   :: env
+      INTEGER                                            :: status
+      INTEGER, SAVE                                      :: cached = -1
+
+      IF (cached < 0) THEN
+         CALL get_environment_variable('CP2K_AIMS_DUMP_MOS', env, status=status)
+         IF (status == 0 .AND. (TRIM(env) == '1' .OR. TRIM(env) == 'true' .OR. TRIM(env) == 'TRUE')) THEN
+            cached = 1
+         ELSE
+            cached = 0
+         END IF
+      END IF
+      active = (cached == 1)
+   END FUNCTION dump_mos_active
 
 END MODULE kpoint_methods

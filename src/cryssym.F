@@ -14,8 +14,6 @@ MODULE cryssym
    USE bibliography,                    ONLY: Togo2018,&
                                               cite_reference
    USE kinds,                           ONLY: dp
-   USE kpsym,                           ONLY: group1s,&
-                                              k290s
    USE spglib_f08,                      ONLY: spg_get_international,&
                                               spg_get_major_version,&
                                               spg_get_micro_version,&
@@ -66,7 +64,7 @@ MODULE cryssym
       INTEGER                                     :: n_operations = 0
       INTEGER, DIMENSION(:, :, :), ALLOCATABLE    :: rotations
       REAL(KIND=dp), DIMENSION(:, :), ALLOCATABLE :: translations
-      !K290
+      !Symmetry group (populated from spglib data)
       REAL(KIND=dp), DIMENSION(3, 3, 48)          :: rt = 0.0_dp
       REAL(KIND=dp), DIMENSION(3, 48)             :: vt = 0.0_dp
       INTEGER, ALLOCATABLE, DIMENSION(:, :)       :: f0
@@ -367,11 +365,12 @@ CONTAINS
    END SUBROUTINE kpoint_gen
 
 ! **************************************************************************************************
-!> \brief ...
+!> \brief IBZ reduction by manually applying spglib rotation matrices to the full k-grid
+!> Also populates csym%rt/vt/f0/nrtot/ibrot.
 !> \param csym ...
-!> \param xkp ...
-!> \param wkp ...
-!> \param kpop ...
+!> \param xkp   full k-point grid from full_grid_gen (fractional reciprocal coordinates)
+!> \param wkp   output multiplicities: >0 for IBZ representatives, 0 otherwise
+!> \param kpop  output rotation index mapping each k-point to its representative
 ! **************************************************************************************************
    SUBROUTINE kp_symmetry(csym, xkp, wkp, kpop)
       TYPE(csym_type)                                    :: csym
@@ -379,115 +378,144 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:)                        :: wkp
       INTEGER, DIMENSION(:)                              :: kpop
 
-      INTEGER                                            :: i, ihc, ihg, ik, indpg, iou, iq1, iq2, &
-                                                            iq3, istriz, isy, itoj, j, kr, li, lr, &
-                                                            nat, nc, nhash, nkm, nkp, nkpoint, &
-                                                            nsp, ntvec
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: includ, isc, list, lwght, ty
-      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: f0, lrot
-      INTEGER, DIMENSION(48)                             :: ib
-      REAL(KIND=dp)                                      :: alat
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: rlist, rx, tvec, wvkl, xkapa
-      REAL(KIND=dp), DIMENSION(3)                        :: a1, a2, a3, b1, b2, b3, origin, rr, wvk0
-      REAL(KIND=dp), DIMENSION(3, 3)                     :: hmat, strain
-      REAL(KIND=dp), DIMENSION(3, 3, 48)                 :: r
-      REAL(KIND=dp), DIMENSION(3, 48)                    :: vt
+      INTEGER                                            :: i, ia, irot, j, nat, nkpts, cp2k_rep
+      REAL(KIND=dp)                                      :: dk(3), rk(3), det
+      REAL(KIND=dp)                                      :: rt_invt(3, 3, 48)
+      REAL(KIND=dp)                                      :: A(3, 3)
 
-      iou = csym%punit
-      hmat = csym%hmat
       nat = csym%nat
-      iq1 = csym%mesh(1)
-      iq2 = csym%mesh(2)
-      iq3 = csym%mesh(3)
-      nkpoint = 10*iq1*iq2*iq3
-      nkpoint = 2*MAX(iq1, iq2, iq3)**3
-      wvk0 = csym%wvk0
-      istriz = csym%istriz
-      a1(1:3) = hmat(1:3, 1)
-      a2(1:3) = hmat(1:3, 2)
-      a3(1:3) = hmat(1:3, 3)
-      alat = hmat(1, 1)
-      strain = 0.0_dp
-      ALLOCATE (xkapa(3, nat), rx(3, nat), tvec(3, 200), ty(nat), isc(nat), f0(49, nat))
-      ty(1:nat) = csym%atype(1:nat)
-      nsp = MAXVAL(ty)
-      DO i = 1, nat
-         xkapa(1:3, i) = MATMUL(hmat, csym%scoord(1:3, i))
-      END DO
-      nhash = 1000
-      ALLOCATE (wvkl(3, nkpoint), rlist(3, nkpoint), includ(nkpoint), list(nhash + nkpoint))
-      ALLOCATE (lrot(48, nkpoint), lwght(nkpoint))
+      nkpts = csym%mesh(1)*csym%mesh(2)*csym%mesh(3)
 
-      IF (iou > 0) THEN
-         WRITE (iou, '(/,(T2,A79))') &
-            "*******************************************************************************", &
-            "**                      Special K-Point Generation by K290                   **", &
-            "*******************************************************************************"
-      END IF
-
-      CALL K290s(iou, nat, nkpoint, nsp, iq1, iq2, iq3, istriz, &
-                 a1, a2, a3, alat, strain, xkapa, rx, tvec, &
-                 ty, isc, f0, ntvec, wvk0, wvkl, lwght, lrot, &
-                 nhash, includ, list, rlist, csym%delta)
-
-      CALL GROUP1s(0, a1, a2, a3, nat, ty, xkapa, b1, b2, b3, &
-                   ihg, ihc, isy, li, nc, indpg, ib, ntvec, &
-                   vt, f0, r, tvec, origin, rx, isc, csym%delta)
-
-      IF (iou > 0) THEN
-         WRITE (iou, '((T2,A79))') &
-            "*******************************************************************************", &
-            "**                              Finished K290                                **", &
-            "*******************************************************************************"
-      END IF
-
-      csym%rt = r
-      csym%vt = vt
-      csym%nrtot = nc
-      ALLOCATE (csym%f0(nat, nc))
-      DO i = 1, nc
-         csym%f0(1:nat, i) = f0(i, 1:nat)
-      END DO
+      ! --- populate symmetry group arrays from spglib rotation data ---
+      csym%nrtot = csym%n_operations
+      CPASSERT(csym%n_operations <= 48)
+      csym%rt = 0.0_dp
+      csym%vt = 0.0_dp
       csym%ibrot = 0
-      csym%ibrot(1:nc) = ib(1:nc)
-
-      kpop = 0
-      nkm = iq1*iq2*iq3
-      nkp = 0
-      DO i = 1, nkm
-         IF (lwght(i) == 0) EXIT
-         nkp = nkp + 1
+      rt_invt = 0.0_dp
+      DO irot = 1, csym%n_operations
+         csym%rt(:, :, irot) = REAL(csym%rotations(:, :, irot), KIND=dp)
+         csym%vt(:, irot) = csym%translations(:, irot)
+         csym%ibrot(irot) = irot
+         ! Precompute R^{-T} for k-point transformation.
+         ! spglib rotations act on direct-lattice fractional coords; k-points in
+         ! reciprocal fractional coords transform as R^{-T} (= cofactor / det).
+         A = csym%rt(:, :, irot)
+         det = A(1, 1)*(A(2, 2)*A(3, 3) - A(2, 3)*A(3, 2)) &
+             - A(1, 2)*(A(2, 1)*A(3, 3) - A(2, 3)*A(3, 1)) &
+             + A(1, 3)*(A(2, 1)*A(3, 2) - A(2, 2)*A(3, 1))
+         rt_invt(1, 1, irot) = (A(2, 2)*A(3, 3) - A(2, 3)*A(3, 2))/det
+         rt_invt(1, 2, irot) = -(A(2, 1)*A(3, 3) - A(2, 3)*A(3, 1))/det
+         rt_invt(1, 3, irot) = (A(2, 1)*A(3, 2) - A(2, 2)*A(3, 1))/det
+         rt_invt(2, 1, irot) = -(A(1, 2)*A(3, 3) - A(1, 3)*A(3, 2))/det
+         rt_invt(2, 2, irot) = (A(1, 1)*A(3, 3) - A(1, 3)*A(3, 1))/det
+         rt_invt(2, 3, irot) = -(A(1, 1)*A(3, 2) - A(1, 2)*A(3, 1))/det
+         rt_invt(3, 1, irot) = (A(1, 2)*A(2, 3) - A(1, 3)*A(2, 2))/det
+         rt_invt(3, 2, irot) = -(A(1, 1)*A(2, 3) - A(1, 3)*A(2, 1))/det
+         rt_invt(3, 3, irot) = (A(1, 1)*A(2, 2) - A(1, 2)*A(2, 1))/det
       END DO
-      wkp = 0
-      ik = 0
-      DO i = 1, nkp
-         DO j = 1, nkm
-            wvk0(1:3) = xkp(1:3, j) - wvkl(1:3, i)
-            IF (ALL(ABS(wvk0(1:3)) < 1.e-12_dp)) THEN
-               wkp(j) = lwght(i)
-               itoj = j
-               EXIT
-            END IF
-         END DO
-         DO lr = 1, lwght(i)
-            kr = lrot(lr, i)
-            rr(1:3) = kp_apply_operation(wvkl(1:3, i), r(1:3, 1:3, ABS(kr)))
-            IF (kr < 0) rr(1:3) = -rr(1:3)
-            DO j = 1, nkm
-               wvk0(1:3) = xkp(1:3, j) - rr(1:3)
-               IF (ALL(ABS(wvk0(1:3)) < 1.e-12_dp)) THEN
-                  csym%kplink(1, j) = itoj
-                  kpop(j) = kr
+
+      ! atom permutation table: f0(ia, irot) = image of atom ia under operation irot
+      IF (ALLOCATED(csym%f0)) DEALLOCATE (csym%f0)
+      ALLOCATE (csym%f0(nat, csym%n_operations))
+      csym%f0 = 0
+      DO irot = 1, csym%n_operations
+         DO ia = 1, nat
+            rk = MATMUL(csym%rt(:, :, irot), csym%scoord(:, ia)) + csym%translations(:, irot)
+            DO j = 1, nat
+               dk = rk - csym%scoord(:, j)
+               dk = dk - ANINT(dk)
+               IF (ALL(ABS(dk) < csym%delta)) THEN
+                  csym%f0(ia, irot) = j
                   EXIT
                END IF
             END DO
          END DO
       END DO
-      DEALLOCATE (xkapa, rx, tvec, ty, isc, f0)
-      DEALLOCATE (wvkl, rlist, includ, list)
-      DEALLOCATE (lrot, lwght)
+
+      ! --- IBZ reduction: manual rotation loop ---
+      ! Each k-point starts as its own representative.
+      ! Scanning in index order guarantees the lowest-index point becomes the representative.
+      DO i = 1, nkpts
+         csym%kplink(1, i) = i
+      END DO
+      DO i = 1, nkpts
+         IF (csym%kplink(1, i) /= i) CYCLE   ! already mapped to a lower-index representative
+         DO irot = 1, csym%n_operations
+            ! standard rotation: R^{-T} * k_i (correct for reciprocal fractional coords)
+            rk = MATMUL(rt_invt(:, :, irot), xkp(:, i))
+            rk = rk - ANINT(rk)              ! fold to [-0.5, 0.5)
+            j = kpoint_cp2k_index(rk, csym%mesh)
+            IF (j > i .AND. csym%kplink(1, j) == j) csym%kplink(1, j) = i
+            ! time-reversal: -R^{-T} * k_i
+            rk = -MATMUL(rt_invt(:, :, irot), xkp(:, i))
+            rk = rk - ANINT(rk)
+            j = kpoint_cp2k_index(rk, csym%mesh)
+            IF (j > i .AND. csym%kplink(1, j) == j) csym%kplink(1, j) = i
+         END DO
+      END DO
+
+      ! --- fill wkp (multiplicities) from kplink ---
+      wkp = 0.0_dp
+      DO i = 1, nkpts
+         wkp(csym%kplink(1, i)) = wkp(csym%kplink(1, i)) + 1.0_dp
+      END DO
+      DO i = 1, nkpts
+         IF (csym%kplink(1, i) /= i) wkp(i) = 0.0_dp
+      END DO
+
+      ! --- find symmetry operation index for each k-point (kpop) ---
+      ! kpop(i): index into csym%rt of the operation mapping representative -> i;
+      !          positive = rotation only, negative = rotation + time-reversal
+      DO i = 1, nkpts
+         cp2k_rep = csym%kplink(1, i)
+         IF (cp2k_rep == i) THEN
+            kpop(i) = 1
+         ELSE
+            kpop(i) = 1   ! fallback: identity
+            DO irot = 1, csym%n_operations
+               rk = MATMUL(rt_invt(:, :, irot), xkp(:, cp2k_rep))
+               dk = rk - xkp(:, i)
+               dk = dk - ANINT(dk)
+               IF (ALL(ABS(dk) < 1.0e-10_dp)) THEN
+                  kpop(i) = irot; EXIT
+               END IF
+               rk = -MATMUL(rt_invt(:, :, irot), xkp(:, cp2k_rep))
+               dk = rk - xkp(:, i)
+               dk = dk - ANINT(dk)
+               IF (ALL(ABS(dk) < 1.0e-10_dp)) THEN
+                  kpop(i) = -irot; EXIT
+               END IF
+            END DO
+         END IF
+      END DO
 
    END SUBROUTINE kp_symmetry
+
+! **************************************************************************************************
+!> \brief Compute the CP2K xkp linear index for a fractional k-point.
+!>        Inverse of full_grid_gen: k(j) = (2*i_j - n_j - 1) / (2*n_j)
+!>        Returns 0 if rk does not correspond to a grid point.
+!> \param rk    fractional k-point coordinates, folded to [-0.5, 0.5)
+!> \param mesh  k-point mesh dimensions
+! **************************************************************************************************
+   FUNCTION kpoint_cp2k_index(rk, mesh) RESULT(idx)
+      REAL(KIND=dp), INTENT(IN)                          :: rk(3)
+      INTEGER, INTENT(IN)                                :: mesh(3)
+      INTEGER                                            :: idx, ix, iy, iz
+
+      ix = (NINT(rk(1)*2.0_dp*REAL(mesh(1), dp)) + mesh(1) + 1)/2
+      iy = (NINT(rk(2)*2.0_dp*REAL(mesh(2), dp)) + mesh(2) + 1)/2
+      iz = (NINT(rk(3)*2.0_dp*REAL(mesh(3), dp)) + mesh(3) + 1)/2
+      IF (ix < 1 .OR. ix > mesh(1) .OR. &
+          iy < 1 .OR. iy > mesh(2) .OR. &
+          iz < 1 .OR. iz > mesh(3)) THEN
+         idx = 0
+      ELSE
+         idx = (ix - 1)*mesh(2)*mesh(3) + (iy - 1)*mesh(3) + iz
+      END IF
+
+   END FUNCTION kpoint_cp2k_index
 ! **************************************************************************************************
 !> \brief ...
 !> \param nk ...
@@ -555,21 +583,6 @@ CONTAINS
 
    END SUBROUTINE inversion_symm
 
-! **************************************************************************************************
-!> \brief ...
-!> \param x ...
-!> \param r ...
-!> \return ...
-! **************************************************************************************************
-   FUNCTION kp_apply_operation(x, r) RESULT(y)
-      REAL(KIND=dp), INTENT(IN)                          :: x(3), r(3, 3)
-      REAL(KIND=dp)                                      :: y(3)
-
-      y(1) = r(1, 1)*x(1) + r(1, 2)*x(2) + r(1, 3)*x(3)
-      y(2) = r(2, 1)*x(1) + r(2, 2)*x(2) + r(2, 3)*x(3)
-      y(3) = r(3, 1)*x(1) + r(3, 2)*x(2) + r(3, 3)*x(3)
-
-   END FUNCTION kp_apply_operation
 
 ! **************************************************************************************************
 !> \brief ...

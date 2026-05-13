@@ -194,6 +194,16 @@ MODULE kpoint_types
       INTEGER, DIMENSION(:), POINTER          :: ibrot => Null()
       TYPE(kind_rotmat_type), DIMENSION(:, :), &
          POINTER                              :: kind_rotmat => Null()
+      ! spglib DM reconstruction: fractional atom coords + dispatch
+      REAL(KIND=dp), DIMENSION(:, :), POINTER :: scoord => Null()
+      LOGICAL                                 :: use_spglib_dm = .TRUE.
+      ! Per-IBZ-rotation spatial part (rt) and translation (vt) of each
+      ! space-group operation, indexed by ira (1..SIZE(ibrot)).
+      ! Needed by the spglib path to absorb the non-symmorphic
+      ! translation V into the per-atom phase factor of Delta.
+      ! rt is the C-row-major spglib_rotations stored in Fortran (= R_C^T).
+      REAL(KIND=dp), DIMENSION(:, :, :), POINTER :: symop_rt => Null()
+      REAL(KIND=dp), DIMENSION(:, :), POINTER    :: symop_vt => Null()
       ! pools
       TYPE(qs_matrix_pools_type), POINTER     :: mpools => Null()
       TYPE(qs_diis_buffer_type_kp), POINTER   :: scf_diis_buffer => Null()
@@ -308,6 +318,9 @@ CONTAINS
 
          IF (ASSOCIATED(kpoint%atype)) DEALLOCATE (kpoint%atype)
          IF (ASSOCIATED(kpoint%ibrot)) DEALLOCATE (kpoint%ibrot)
+         IF (ASSOCIATED(kpoint%scoord)) DEALLOCATE (kpoint%scoord)
+         IF (ASSOCIATED(kpoint%symop_rt)) DEALLOCATE (kpoint%symop_rt)
+         IF (ASSOCIATED(kpoint%symop_vt)) DEALLOCATE (kpoint%symop_vt)
 
          IF (ASSOCIATED(kpoint%kind_rotmat)) THEN
             DO i = 1, SIZE(kpoint%kind_rotmat, 1)
