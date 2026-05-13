@@ -25,10 +25,15 @@
 !> \author janK 2026-05-04
 ! **************************************************************************************************
 MODULE kpoint_density_spglib
+   USE cp_cfm_basic_linalg,             ONLY: cp_cfm_gemm
+   USE cp_cfm_types,                    ONLY: cp_cfm_create, cp_cfm_get_submatrix, cp_cfm_release, &
+                                              cp_cfm_set_all, cp_cfm_set_submatrix, cp_cfm_type
    USE cp_dbcsr_api,                    ONLY: &
         dbcsr_get_block_p, dbcsr_get_info, dbcsr_get_matrix_type, dbcsr_iterator_blocks_left, &
         dbcsr_iterator_next_block, dbcsr_iterator_start, dbcsr_iterator_stop, dbcsr_iterator_type, &
         dbcsr_set, dbcsr_type, dbcsr_type_no_symmetry
+   USE cp_fm_struct,                    ONLY: cp_fm_struct_create, cp_fm_struct_release, &
+                                              cp_fm_struct_type
    USE cp_fm_types,                     ONLY: cp_fm_get_submatrix, cp_fm_type
    USE kinds,                           ONLY: dp
    USE kpoint_types,                    ONLY: kpoint_env_type, kpoint_sym_type, kpoint_type
@@ -58,17 +63,30 @@ MODULE kpoint_density_spglib
 ! **************************************************************************************************
 !> \brief Per-IBZ-k workspace reused across the star-member loop.
 !>        Allocated once with spglib_dm_workspace_init (which also pulls
-!>        P(k_IBZ) into pmat_kibz); released with spglib_dm_workspace_release.
+!>        P(k_IBZ) into pmat_kibz and the distributed cfm_p); released
+!>        with spglib_dm_workspace_release.
+!>
+!>        Each rank still carries one full local dense P(k_IBZ) (built
+!>        by dbcsr_to_dense_complex via MPI sum) plus per-star-member
+!>        scratch buffers, but the D~ P D~^dagger matrix product itself
+!>        runs through cp_cfm_gemm (PZGEMM): work is distributed across
+!>        the BLACS grid rather than redundantly recomputed on every rank.
 ! **************************************************************************************************
    TYPE spglib_dm_workspace_type
       INTEGER                                          :: natom = 0
       INTEGER                                          :: n_basis_tot = 0
+      LOGICAL                                          :: allocated_cfm = .FALSE.
       INTEGER, ALLOCATABLE, DIMENSION(:)               :: atom_first   ! (natom+1)
       INTEGER, ALLOCATABLE, DIMENSION(:)               :: atom_size    ! (natom)
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)   :: pmat_kibz    ! P(k_IBZ), dense complex
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)   :: pmat_kstar   ! scratch
-      COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)   :: work         ! scratch
       COMPLEX(KIND=dp), ALLOCATABLE, DIMENSION(:, :)   :: delta_full   ! scratch
+      ! Distributed cp_cfm scratch driving the PZGEMM chain.
+      TYPE(cp_fm_struct_type), POINTER                 :: fm_struct => NULL()
+      TYPE(cp_cfm_type)                                :: cfm_p     ! P(k_IBZ)
+      TYPE(cp_cfm_type)                                :: cfm_d     ! Delta
+      TYPE(cp_cfm_type)                                :: cfm_w     ! Delta * P
+      TYPE(cp_cfm_type)                                :: cfm_r     ! Delta * P * Delta^H
    END TYPE spglib_dm_workspace_type
 
 ! **************************************************************************************************
@@ -103,24 +121,29 @@ MODULE kpoint_density_spglib
 CONTAINS
 
 ! **************************************************************************************************
-!> \brief Initialise a per-IBZ-k workspace and pull the IBZ density matrix
-!>        from (rpmat, cpmat) into the dense complex pmat_kibz.
-!> \par   Multi-rank: dbcsr_to_dense_complex replicates the dense P(k_IBZ)
-!>        across the DBCSR MPI group, so the rotation runs redundantly on
-!>        every rank and dense_complex_to_dbcsr writes each rank's owned
-!>        blocks. The legacy symtrans path is bypassed.
+!> \brief Initialise a per-IBZ-k workspace, pull the IBZ density matrix
+!>        from (rpmat, cpmat) into the dense complex pmat_kibz, and
+!>        distribute it into the cp_cfm scratch matrix cfm_p that drives
+!>        the per-star-member PZGEMM chain.
+!> \param fm_struct_template  FM struct cloned from the caller's fmwork.
+!>        Provides the BLACS context + para_env on which all four cp_cfm
+!>        scratch matrices live. Must describe an n_basis_tot x n_basis_tot
+!>        layout (or a compatible template; the call here forces the
+!>        global dimensions).
 ! **************************************************************************************************
-   SUBROUTINE spglib_dm_workspace_init(ws, kpoint, rpmat, cpmat, real_only)
+   SUBROUTINE spglib_dm_workspace_init(ws, kpoint, rpmat, cpmat, real_only, fm_struct_template)
       TYPE(spglib_dm_workspace_type), INTENT(OUT)          :: ws
       TYPE(kpoint_type), POINTER                         :: kpoint
       TYPE(dbcsr_type), POINTER                          :: rpmat, cpmat
       LOGICAL, INTENT(IN)                                :: real_only
+      TYPE(cp_fm_struct_type), POINTER, INTENT(IN)       :: fm_struct_template
 
       CPASSERT(ASSOCIATED(kpoint))
       CPASSERT(ASSOCIATED(kpoint%scoord))
       CPASSERT(ASSOCIATED(kpoint%atype))
       CPASSERT(ASSOCIATED(kpoint%ibrot))
       CPASSERT(ASSOCIATED(kpoint%kind_rotmat))
+      CPASSERT(ASSOCIATED(fm_struct_template))
 
       ws%natom = SIZE(kpoint%atype)
       ALLOCATE (ws%atom_first(ws%natom + 1), ws%atom_size(ws%natom))
@@ -128,10 +151,29 @@ CONTAINS
 
       ALLOCATE (ws%pmat_kibz(ws%n_basis_tot, ws%n_basis_tot))
       ALLOCATE (ws%pmat_kstar(ws%n_basis_tot, ws%n_basis_tot))
-      ALLOCATE (ws%work(ws%n_basis_tot, ws%n_basis_tot))
       ALLOCATE (ws%delta_full(ws%n_basis_tot, ws%n_basis_tot))
 
+      ! Build the local dense P(k_IBZ) replicated on every rank. The
+      ! cp_cfm push below is purely local (no MPI in cp_cfm_set_submatrix),
+      ! so we still need the full N x N on every rank here.
       CALL dbcsr_to_dense_complex(rpmat, cpmat, real_only, ws%atom_first, ws%atom_size, ws%pmat_kibz)
+
+      ! Clone the fmwork struct but force square N_basis_tot x N_basis_tot
+      ! global dimensions so the cfm matrices match the rotation algebra.
+      NULLIFY (ws%fm_struct)
+      CALL cp_fm_struct_create(ws%fm_struct, &
+                               nrow_global=ws%n_basis_tot, &
+                               ncol_global=ws%n_basis_tot, &
+                               template_fmstruct=fm_struct_template)
+      CALL cp_cfm_create(ws%cfm_p, ws%fm_struct)
+      CALL cp_cfm_create(ws%cfm_d, ws%fm_struct)
+      CALL cp_cfm_create(ws%cfm_w, ws%fm_struct)
+      CALL cp_cfm_create(ws%cfm_r, ws%fm_struct)
+      ws%allocated_cfm = .TRUE.
+
+      ! Distribute P(k_IBZ) into cfm_p (no MPI; each rank writes its
+      ! owned block-cyclic tile from the replicated pmat_kibz).
+      CALL cp_cfm_set_submatrix(ws%cfm_p, ws%pmat_kibz)
    END SUBROUTINE spglib_dm_workspace_init
 
 ! **************************************************************************************************
@@ -144,8 +186,15 @@ CONTAINS
       IF (ALLOCATED(ws%atom_size)) DEALLOCATE (ws%atom_size)
       IF (ALLOCATED(ws%pmat_kibz)) DEALLOCATE (ws%pmat_kibz)
       IF (ALLOCATED(ws%pmat_kstar)) DEALLOCATE (ws%pmat_kstar)
-      IF (ALLOCATED(ws%work)) DEALLOCATE (ws%work)
       IF (ALLOCATED(ws%delta_full)) DEALLOCATE (ws%delta_full)
+      IF (ws%allocated_cfm) THEN
+         CALL cp_cfm_release(ws%cfm_p)
+         CALL cp_cfm_release(ws%cfm_d)
+         CALL cp_cfm_release(ws%cfm_w)
+         CALL cp_cfm_release(ws%cfm_r)
+         CALL cp_fm_struct_release(ws%fm_struct)
+         ws%allocated_cfm = .FALSE.
+      END IF
       ws%natom = 0
       ws%n_basis_tot = 0
    END SUBROUTINE spglib_dm_workspace_release
@@ -198,15 +247,25 @@ CONTAINS
       CALL build_full_delta(kpoint, kpsym, is, ira, xkp_ibz, &
                             ws%natom, ws%atom_first, ws%atom_size, ws%n_basis_tot, ws%delta_full)
 
-      ! P(k_spatial) = Delta * P(k_IBZ) * Delta^dagger
-      CALL ZGEMM('N', 'N', ws%n_basis_tot, ws%n_basis_tot, ws%n_basis_tot, &
-                 (1.0_dp, 0.0_dp), ws%delta_full, ws%n_basis_tot, &
-                 ws%pmat_kibz, ws%n_basis_tot, &
-                 (0.0_dp, 0.0_dp), ws%work, ws%n_basis_tot)
-      CALL ZGEMM('N', 'C', ws%n_basis_tot, ws%n_basis_tot, ws%n_basis_tot, &
-                 (1.0_dp, 0.0_dp), ws%work, ws%n_basis_tot, &
-                 ws%delta_full, ws%n_basis_tot, &
-                 (0.0_dp, 0.0_dp), ws%pmat_kstar, ws%n_basis_tot)
+      ! Distribute the (replicated) local delta into the cp_cfm tile
+      ! (no MPI here -- each rank just writes its owned block-cyclic
+      ! entries from the local copy).
+      CALL cp_cfm_set_submatrix(ws%cfm_d, ws%delta_full)
+
+      ! P(k_spatial) = Delta * P(k_IBZ) * Delta^dagger via two PZGEMM
+      ! calls on the cp_cfm tiles -- compute is parallelised across the
+      ! BLACS grid.
+      CALL cp_cfm_gemm('N', 'N', ws%n_basis_tot, ws%n_basis_tot, ws%n_basis_tot, &
+                       (1.0_dp, 0.0_dp), ws%cfm_d, ws%cfm_p, &
+                       (0.0_dp, 0.0_dp), ws%cfm_w)
+      CALL cp_cfm_gemm('N', 'C', ws%n_basis_tot, ws%n_basis_tot, ws%n_basis_tot, &
+                       (1.0_dp, 0.0_dp), ws%cfm_w, ws%cfm_d, &
+                       (0.0_dp, 0.0_dp), ws%cfm_r)
+
+      ! Gather the distributed result into the replicated pmat_kstar
+      ! (cp_cfm_get_submatrix internally para_env%sum's the tiles, so
+      ! every rank ends up with the full N x N P(k_star)).
+      CALL cp_cfm_get_submatrix(ws%cfm_r, ws%pmat_kstar)
 
       IF (kpsym%rotp(is) < 0) ws%pmat_kstar = CONJG(ws%pmat_kstar)
 

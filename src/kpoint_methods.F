@@ -1765,7 +1765,8 @@ CONTAINS
                ELSE IF (use_spglib) THEN
                   ! Fallback (no MO access or do_ext path):
                   ! P(k_star) = D * P(k_IBZ) * D^dagger on the assembled DM.
-                  CALL spglib_dm_workspace_init(spglib_ws, kpoint, rpmat, cpmat, real_only)
+                  CALL spglib_dm_workspace_init(spglib_ws, kpoint, rpmat, cpmat, real_only, &
+                                                fmwork(1)%matrix_struct)
                   DO is = 1, kpsym%nwght
                      CALL spglib_dm_rotate_one_star(spglib_ws, kpoint, kpsym, is, &
                                                   xkp(1:3, ik), real_only, srpmat, scpmat)
