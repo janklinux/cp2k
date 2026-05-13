@@ -4,6 +4,7 @@
 # in case a new directory is added just add it at the top of the list..
 # the order will be regularly checked and modified...
 QS/regtest-kp-spglib-sym                                    spglib mpiranks==1
+QS/regtest-kp-spglib-sym-mpi                                spglib mpiranks>=2
 QS/regtest-moments-kpoints
 MIMIC/regtest-qmmm                                          mimic mpiranks==4
 QS/regtest-monovalent

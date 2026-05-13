@@ -1,0 +1,65 @@
+# Regression test for the multi-rank (MPI) spglib-based k-point IBZ
+# symmetry path. Same 26 sym/nosym pairs as regtest-kp-spglib-sym/, but
+# the dir is tagged mpiranks>=2 in TEST_DIRS so it exercises the
+# parallel DM-rotation chain (numnodes > 1 in kpoint_methods.F).
+# Until the MPI chain lands, dispatch falls back to the legacy symtrans
+# path -- which must still reproduce the nosym reference. Once the new
+# multi-rank spglib path is enabled, this regtest catches regressions.
+# Reference energies match regtest-kp-spglib-sym/ (taken from the
+# SYMMETRY OFF runs); tol=1.0E-8 Ha is the agreement criterion (the
+# largest sym/nosym disagreement seen in the single-rank bench was
+# ~2.2e-9 Ha for case 07 BrCl, point group mm2).
+
+"01_FeSiP4_nosym.inp                " = [{matcher="E_total", tol=1.0E-8, ref=-165.512283159474}]
+"01_FeSiP4_sym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-165.512283159474}]
+"02_PI2_nosym.inp                   " = [{matcher="E_total", tol=1.0E-8, ref=-59.138876341784}]
+"02_PI2_sym.inp                     " = [{matcher="E_total", tol=1.0E-8, ref=-59.138876341784}]
+"03_CsAsF4_nosym.inp                " = [{matcher="E_total", tol=1.0E-8, ref=-246.708263094072}]
+"03_CsAsF4_sym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-246.708263094072}]
+"04_BaBeSiO4_nosym.inp              " = [{matcher="E_total", tol=1.0E-8, ref=-107.857264468551}]
+"04_BaBeSiO4_sym.inp                " = [{matcher="E_total", tol=1.0E-8, ref=-107.857264468551}]
+"05_CrF2_nosym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-270.238609689380}]
+"05_CrF2_sym.inp                    " = [{matcher="E_total", tol=1.0E-8, ref=-270.238609689380}]
+"06_H2_nosym.inp                    " = [{matcher="E_total", tol=1.0E-8, ref=-4.507693709747}]
+"06_H2_sym.inp                      " = [{matcher="E_total", tol=1.0E-8, ref=-4.507693709747}]
+"07_BrCl_nosym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-56.779223842882}]
+"07_BrCl_sym.inp                    " = [{matcher="E_total", tol=1.0E-8, ref=-56.779223842882}]
+"08_BaAg_nosym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-249.803784895170}]
+"08_BaAg_sym.inp                    " = [{matcher="E_total", tol=1.0E-8, ref=-249.803784895170}]
+"11_BaMoO4_nosym.inp                " = [{matcher="E_total", tol=1.0E-8, ref=-315.425361992352}]
+"11_BaMoO4_sym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-315.425361992352}]
+"12_CdAs2_nosym.inp                 " = [{matcher="E_total", tol=1.0E-8, ref=-117.528092329232}]
+"12_CdAs2_sym.inp                   " = [{matcher="E_total", tol=1.0E-8, ref=-117.528092329232}]
+"13_CoBiO3_nosym.inp                " = [{matcher="E_total", tol=1.0E-8, ref=-198.879723518677}]
+"13_CoBiO3_sym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-198.879723518677}]
+"14_AgClO4_nosym.inp                " = [{matcher="E_total", tol=1.0E-8, ref=-114.823930868482}]
+"14_AgClO4_sym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-114.823930868482}]
+"15_BW2_nosym.inp                   " = [{matcher="E_total", tol=1.0E-8, ref=-278.242584498369}]
+"15_BW2_sym.inp                     " = [{matcher="E_total", tol=1.0E-8, ref=-278.242584498369}]
+"16_InNi2SbO6_nosym.inp             " = [{matcher="E_total", tol=1.0E-8, ref=-496.057162247991}]
+"16_InNi2SbO6_sym.inp               " = [{matcher="E_total", tol=1.0E-8, ref=-496.057162247991}]
+"17_ReCl6_nosym.inp                 " = [{matcher="E_total", tol=1.0E-8, ref=-169.065938296851}]
+"17_ReCl6_sym.inp                   " = [{matcher="E_total", tol=1.0E-8, ref=-169.065938296851}]
+"18_Ni3S2_nosym.inp                 " = [{matcher="E_total", tol=1.0E-8, ref=-527.407099016532}]
+"18_Ni3S2_sym.inp                   " = [{matcher="E_total", tol=1.0E-8, ref=-527.407099016532}]
+"19_GeTe_nosym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-12.152019279979}]
+"19_GeTe_sym.inp                    " = [{matcher="E_total", tol=1.0E-8, ref=-12.152019279979}]
+"20_AlF3_nosym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-149.692662612976}]
+"20_AlF3_sym.inp                    " = [{matcher="E_total", tol=1.0E-8, ref=-149.692662612976}]
+"21_PI3_nosym.inp                   " = [{matcher="E_total", tol=1.0E-8, ref=-82.159010693402}]
+"21_PI3_sym.inp                     " = [{matcher="E_total", tol=1.0E-8, ref=-82.159010693402}]
+"23_BBr3_nosym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-86.405583578069}]
+"23_BBr3_sym.inp                    " = [{matcher="E_total", tol=1.0E-8, ref=-86.405583578069}]
+"25_AlN_nosym.inp                   " = [{matcher="E_total", tol=1.0E-8, ref=-24.164975115047}]
+"25_AlN_sym.inp                     " = [{matcher="E_total", tol=1.0E-8, ref=-24.164975115047}]
+"26_TaN_nosym.inp                   " = [{matcher="E_total", tol=1.0E-8, ref=-204.552154482912}]
+"26_TaN_sym.inp                     " = [{matcher="E_total", tol=1.0E-8, ref=-204.552154482912}]
+"27_Cd_nosym.inp                    " = [{matcher="E_total", tol=1.0E-8, ref=-92.134925121485}]
+"27_Cd_sym.inp                      " = [{matcher="E_total", tol=1.0E-8, ref=-92.134925121485}]
+"28_AlPd_nosym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-515.618886612922}]
+"28_AlPd_sym.inp                    " = [{matcher="E_total", tol=1.0E-8, ref=-515.618886612922}]
+"31_AlAs_nosym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-8.468894294816}]
+"31_AlAs_sym.inp                    " = [{matcher="E_total", tol=1.0E-8, ref=-8.468894294816}]
+"32_AlCo_nosym.inp                  " = [{matcher="E_total", tol=1.0E-8, ref=-147.469657787662}]
+"32_AlCo_sym.inp                    " = [{matcher="E_total", tol=1.0E-8, ref=-147.469657787662}]
+#EOF
