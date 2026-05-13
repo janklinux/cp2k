@@ -37,6 +37,7 @@ methods/qm_mm/index
 methods/sampling/index
 methods/optimization/index
 methods/properties/index
+methods/spglib
 ```
 
 ```{toctree}
